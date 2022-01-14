@@ -1,0 +1,1289 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 04/22/2021 06:43:34 PM
+// Design Name: 
+// Module Name: my_core
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+import my_riscv_defines::*;
+
+`ifndef VERILATOR
+`ifndef SYNTHESIS
+`ifndef PULP_FPGA_EMUL
+`define TRACE_EXECUTION
+`endif
+`endif
+`endif
+ 
+/*
+TODO LIST
+2. ECALL instruction  : where to return? mepc or mepc+4,  which will control? sw or hw  --> my opinion : sw control mepc + 4 on exception handler
+3. clock gating
+*/
+
+module my_core 
+#(
+    parameter N_EXT_PERF_COUNTERS =  0,
+    parameter INSTR_RDATA_WIDTH   = 32,
+    parameter PULP_SECURE         =  0,
+    parameter N_PMP_ENTRIES       = 16,
+    parameter USE_PMP             =  1, //if PULP_SECURE is 1, you can still not use the PMP
+    parameter PULP_CLUSTER        =  1,
+    parameter FPU                 =  0,
+    parameter Zfinx               =  0,
+    parameter FP_DIVSQRT          =  0,
+    parameter SHARED_FP           =  0,
+    parameter SHARED_DSP_MULT     =  0,
+    parameter SHARED_INT_MULT     =  0,
+    parameter SHARED_INT_DIV      =  0,
+    parameter SHARED_FP_DIVSQRT   =  0,
+    parameter WAPUTYPE            =  0,
+    parameter APU_NARGS_CPU       =  3,
+    parameter APU_WOP_CPU         =  6,
+    parameter APU_NDSFLAGS_CPU    = 15,
+    parameter APU_NUSFLAGS_CPU    =  5,
+    parameter DM_HaltAddress      = 32'h1A110800
+) (
+    // Clock and Reset
+    input  logic        clk_i,
+    input  logic        rst_ni,    
+    input  logic        clock_en_i,    // enable clock, otherwise it is gated
+    input  logic        test_en_i,     // enable all clock gates for testing
+        
+    // Core ID, Cluster ID and boot address are considered more or less static
+    input  logic [31:0] boot_addr_i,
+    input  logic [ 3:0] core_id_i,
+    input  logic [ 5:0] cluster_id_i,
+    
+    // Instruction memory interface
+    output logic                         instr_req_o,
+    input  logic                         instr_gnt_i,
+    input  logic                         instr_rvalid_i,
+    output logic                  [31:0] instr_addr_o,
+    input  logic [INSTR_RDATA_WIDTH-1:0] instr_rdata_i,
+    
+    // Data memory interface
+    output logic        data_req_o,
+    input  logic        data_gnt_i,
+    input  logic        data_rvalid_i,
+    output logic        data_we_o,
+    output logic [3:0]  data_be_o,
+    output logic [31:0] data_addr_o,
+    output logic [31:0] data_wdata_o,
+    input  logic [31:0] data_rdata_i,
+    
+    // Interrupt inputs
+    input  logic        irq_i,                 // level sensitive IR lines
+    input  logic [4:0]  irq_id_i,
+    output logic        irq_ack_o,
+    output logic [4:0]  irq_id_o,
+    input  logic        irq_sec_i,              // fixed 1'b0
+        
+    // Debug Interface
+    input  logic        debug_req_i,
+    
+    // CPU Control Signals
+    input  logic        fetch_enable_i,    
+    input  logic [N_EXT_PERF_COUNTERS-1:0] ext_perf_counters_i
+
+);
+
+    logic       c_auipc;
+    logic       c_lui;
+    logic       c_branch;
+    logic       c_jal;
+    logic       c_jalr;
+    logic       c_load;
+    logic       c_store;
+    logic       c_regwrite;
+    logic       c_alusrc;
+    logic [4:0] c_alucont;
+    
+    logic [1:0] c_csr_op;
+    logic       c_csr_imm;
+    logic       c_readcsr;
+    logic       c_writecsr;
+    logic       c_regwrite_by_csr;
+    
+    logic       c_ecall;
+    logic       c_wfi;
+    logic       c_mret;
+    
+    logic       exc_illegal_instr;
+    
+    logic       stall, save_instr, stall_done;
+    logic       flush;
+    logic       irq_taken;
+
+    logic [31:0]    instr_IF, instr_ID;
+    logic [31:0]    instr_buff_n, instr_buff_c;
+    
+    logic clk, clock_en_n, clock_en_c;
+    logic sleep, sleep_done;  
+    
+    always_ff @(posedge clk_i or negedge rst_ni)
+    begin
+        if(~rst_ni)     clock_en_c  <= 1;
+        else            clock_en_c  <= clock_en_n;
+    end
+    
+    assign clk  = clk_i & clock_en_c;
+        
+    always_ff @(posedge clk or negedge rst_ni)
+    begin
+        if(~rst_ni)         instr_buff_c    <= '0;
+        else if(save_instr) instr_buff_c    <= instr_buff_n;
+    end
+    
+    always_comb
+    begin
+        if(stall || sleep)   instr_buff_n    = instr_rdata_i;
+        else        instr_buff_n    = instr_buff_c;
+    end
+    
+    always_comb
+    begin
+        if(flush || ~instr_rvalid_i)    instr_IF    = NOP;
+        else if(stall_done || sleep_done)             instr_IF    = instr_buff_c;
+        else                            instr_IF    = instr_rdata_i;
+    end
+    
+    always_ff @(posedge clk or negedge rst_ni)
+    begin
+        if(rst_ni == 0) instr_ID    <= '0;
+        else if(~stall & ~sleep) instr_ID    <= instr_IF;
+    end
+    
+    controller i_controller (
+        .instr_rdata_i  (instr_ID),
+        
+        .c_auipc_o      (c_auipc),
+        .c_lui_o        (c_lui),
+        .c_branch_o     (c_branch),
+        .c_jal_o        (c_jal),
+        .c_jalr_o       (c_jalr),
+        .c_load_o       (c_load),
+        .c_store_o      (c_store),
+        .c_regwrite_o   (c_regwrite),
+        .c_alusrc_o     (c_alusrc),
+        .c_alucont_o    (c_alucont),
+        
+        .c_csr_op_o     (c_csr_op),
+        .c_csr_imm_o    (c_csr_imm),
+        .c_readcsr_o    (c_readcsr),
+        .c_writecsr_o   (c_writecsr),
+        .c_regwrite_by_csr_o    (c_regwrite_by_csr),
+        
+        .c_ecall_o      (c_ecall),
+        .c_wfi_o        (c_wfi),
+        .c_mret_o       (c_mret),
+        
+        .exc_illegal_instr_o    (exc_illegal_instr),
+        
+        .irq_taken_i    (irq_taken)
+    );
+    
+    datapath i_datapath (
+        .clk_i          (clk),
+        .rst_ni         (rst_ni),
+        .fetch_en_i     (fetch_enable_i),
+        .boot_addr_i    (boot_addr_i),
+        
+        .c_auipc_i      (c_auipc),   
+        .c_lui_i        (c_lui),
+        .c_branch_i     (c_branch),
+        .c_jal_i        (c_jal),
+        .c_jalr_i       (c_jalr),
+        .c_load_i       (c_load),
+        .c_store_i      (c_store),
+        .c_regwrite_i   (c_regwrite),
+        .c_alusrc_i     (c_alusrc),
+        .c_alucont_i    (c_alucont),
+        
+        .c_csr_op_i     (c_csr_op),
+        .c_csr_imm_i    (c_csr_imm),
+        .c_readcsr_i    (c_readcsr),
+        .c_writecsr_i   (c_writecsr),
+        .c_regwrite_by_csr_i  (c_regwrite_by_csr),
+        
+        .c_ecall_i      (c_ecall),
+        .c_wfi_i        (c_wfi),
+        .c_mret_i       (c_mret),
+        
+        .instr_req_o    (instr_req_o),
+        .instr_addr_o   (instr_addr_o),
+        .instr_gnt_i    (instr_gnt_i),
+        .instr_rvalid_i (instr_rvalid_i),
+        .instr_rdata_i  (instr_ID),
+        
+        .data_req_o     (data_req_o),
+        .data_addr_o    (data_addr_o),
+        .data_wdata_o   (data_wdata_o),
+        .data_be_o      (data_be_o),
+        .data_we_o      (data_we_o),
+        .data_gnt_i     (data_gnt_i),
+        .data_rvalid_i  (data_rvalid_i),
+        .data_rdata_i   (data_rdata_i),
+        
+        .stall_o        (stall), 
+        .save_instr_o   (save_instr),
+        .stall_done_o   (stall_done),
+        .flush_o        (flush),
+        
+        .irq_i          (irq_i),
+        .irq_id_i       (irq_id_i),
+        .irq_ack_o      (irq_ack_o),
+        .irq_id_o       (irq_id_o),  
+        .irq_taken_o    (irq_taken),
+        
+        .exc_illegal_instr_i    (exc_illegal_instr),
+        
+        .clk_en_o       (clock_en_n),
+        .sleep_o        (sleep),
+        .sleep_done_o   (sleep_done)
+    );
+
+
+endmodule
+
+module controller (
+    input logic [31:0] instr_rdata_i,
+    
+    output logic        c_auipc_o,
+    output logic        c_lui_o,
+    output logic        c_branch_o,
+    output logic        c_jal_o,
+    output logic        c_jalr_o,
+    output logic        c_load_o,
+    output logic        c_store_o,
+    output logic        c_regwrite_o,
+    output logic        c_alusrc_o,
+    output logic [4:0]  c_alucont_o,
+    
+    //priv instructions
+    output logic [1:0]  c_csr_op_o,
+    output logic        c_csr_imm_o,
+    output logic        c_readcsr_o,
+    output logic        c_writecsr_o,
+    output logic        c_regwrite_by_csr_o,
+    
+    output logic        c_ecall_o,
+    output logic        c_wfi_o,
+    output logic        c_mret_o,
+    
+    output logic        exc_illegal_instr_o,
+    
+    input logic         irq_taken_i
+);
+
+
+    logic [6:0] opcode, funct7;
+    logic [2:0] funct3;
+    logic [11:0] funct12;
+    
+    logic [8:0] controls;
+    logic [4:0] alucontrols;
+    logic [6:0] csr_controls;
+    
+    assign opcode = instr_rdata_i[6:0];
+    assign funct3 = instr_rdata_i[14:12];
+    assign funct7 = instr_rdata_i[31:25];
+    assign funct12 = instr_rdata_i[31:20];
+    
+    assign {c_auipc_o, c_lui_o, c_branch_o, c_jal_o, c_jalr_o, c_load_o, c_store_o, c_regwrite_o, c_alusrc_o} = irq_taken_i ? 9'b0 : controls; 
+    assign {c_ecall_o, c_wfi_o, c_mret_o, c_regwrite_by_csr_o, c_csr_imm_o, c_csr_op_o}    = irq_taken_i ? 7'b0 : csr_controls;
+    assign c_alucont_o  = irq_taken_i ? 5'b0 : alucontrols;
+    
+    always_comb
+    begin
+        case(opcode)
+            OP_R:       controls = 9'b0_0000_0010;
+            OP_I:       controls = 9'b0_0000_0011;
+            OP_B:       controls = 9'b0_0100_0000;
+            OP_LOAD:    controls = 9'b0_0000_1011;
+            OP_STORE:   controls = 9'b0_0000_0101;
+            OP_LUI:     controls = 9'b0_1000_0011;
+            OP_JAL:     controls = 9'b0_0010_0011;
+            OP_JALR:    controls = 9'b0_0001_0011;
+            OP_AUIPC:   controls = 9'b1_0000_0011;
+            default:    controls = 9'b0_0000_0000;
+        endcase
+    end
+    
+    always_comb
+    begin
+        case(opcode)
+            OP_R: begin
+                case(funct3)
+                    3'b000: begin 
+                        if(funct7 == 7'b010_0000) alucontrols = 5'b1_0000;    //sub 
+                        else alucontrols = 5'b0_0000;          //add
+                        end
+                    3'b001: alucontrols = 5'b0_0100;           //sll
+                    3'b010: alucontrols = 5'b1_0111;           //slt
+                    3'b011: alucontrols = 5'b1_1000;           //sltu
+                    3'b100: alucontrols = 5'b0_0011;           //xor
+                    3'b101: begin
+                        if(funct7 == 7'b010_0000) alucontrols = 5'b0_0110;    //sra
+                        else alucontrols = 5'b0_0101;          //srl 
+                    end                 
+                    3'b110: alucontrols = 5'b0_0010;           //or
+                    3'b111: alucontrols = 5'b0_0001;           //and
+                endcase
+            end
+            OP_I: begin
+                case(funct3)
+                    3'b000: alucontrols = 5'b0_0000;   //addi
+                    3'b001: alucontrols = 5'b0_0100;   //slli
+                    3'b010: alucontrols = 5'b1_0111;   //slti
+                    3'b011: alucontrols = 5'b1_1000;   //sltiu
+                    3'b100: alucontrols = 5'b0_0011;   //xori
+                    3'b101: begin
+                        if(funct7 == 7'b010_0000) alucontrols = 5'b0_0110;    //srai
+                        else alucontrols = 5'b0_0101;          //srli
+                    end
+                    3'b110: alucontrols = 5'b0_0010;   //ori
+                    3'b111: alucontrols = 5'b0_0001;   //andi
+                endcase
+            end
+            
+            OP_B:           alucontrols = 5'b1_0000;
+            OP_LOAD:        alucontrols = 5'b0_0000;
+            OP_STORE:       alucontrols = 5'b0_0000;
+            OP_LUI:         alucontrols = 5'b0_0000;
+            OP_JAL:         alucontrols = 5'b0_0000;
+            OP_JALR:        alucontrols = 5'b0_0000;
+            OP_AUIPC:       alucontrols = 5'b0_0000;
+            default:        alucontrols = 5'b0_0000;        //OP_SYSTEM : ALU x -> don't care -> default...
+        endcase
+    end
+    
+    always_comb
+    begin
+        if(opcode == OP_SYSTEM) begin
+            case(funct3)
+                3'b000: begin
+                    if(funct12 == ECALL) begin
+                        csr_controls = 7'b100_0000;
+                    end
+                    else if(funct12 == WFI) begin
+                        csr_controls =  7'b010_0000;
+                    end
+                    else if(funct12 == MRET) begin
+                        csr_controls = 7'b001_0000;
+                    end
+                    else begin
+                        csr_controls = 7'b000_0000;
+                    end
+                end
+                3'b001, 3'b101,
+                3'b010, 3'b110,
+                3'b011, 3'b111: csr_controls = {4'b0001, funct3};
+                default: csr_controls = 7'b000_0000;
+            endcase
+        end
+        else begin
+            csr_controls = 7'b000_0000;
+        end
+    end
+    
+    always_comb
+    begin
+        case(c_csr_op_o)
+            2'b01: begin
+                c_writecsr_o    = 1'b1;
+                
+                if(instr_rdata_i[11:7] == 5'b0) begin
+                    c_readcsr_o = 1'b0;
+                end
+                else begin
+                    c_readcsr_o = 1'b1;
+                end
+            end
+            2'b10, 2'b11: begin
+                c_readcsr_o     = 1'b1;
+                
+                if(instr_rdata_i[19:15] == 5'b0) begin
+                    c_writecsr_o    = 1'b0;
+                end
+                else begin
+                    c_writecsr_o    = 1'b1;
+                end
+            end
+            default: begin
+                c_readcsr_o    = 1'b0;
+                c_writecsr_o    = 1'b0;
+            end    
+        endcase
+    end
+        
+    always_comb
+    begin
+        case(opcode)
+            OP_R: begin
+                case(funct3)
+                    3'b000, 3'b101: begin
+                        if(funct7 == 7'b0 || funct7 == 7'b0100000) begin
+                            exc_illegal_instr_o = 1'b0;
+                        end
+                        else begin
+                            exc_illegal_instr_o = 1'b1;
+                        end
+                    end
+                    default: begin
+                        if(funct7 == 7'b0) begin
+                            exc_illegal_instr_o = 1'b0;
+                        end
+                        else begin
+                            exc_illegal_instr_o = 1'b1;
+                        end
+                    end
+                endcase
+            end
+            OP_I: begin
+                case(funct3)
+                    3'b001: begin
+                        if(funct7 == 7'b0) begin
+                            exc_illegal_instr_o = 1'b0;
+                        end
+                        else begin
+                            exc_illegal_instr_o = 1'b1;
+                        end
+                    end
+                    3'b101: begin
+                        if(funct7 == 7'b0 || funct7 == 7'b0100000) begin
+                            exc_illegal_instr_o = 1'b0;
+                        end
+                        else begin
+                            exc_illegal_instr_o = 1'b1;
+                        end
+                    end
+                    default: begin
+                        exc_illegal_instr_o = 1'b0;
+                    end
+                endcase
+            end
+            OP_B: begin
+                if(funct3 == 3'b010 || funct3 == 3'b011) begin
+                    exc_illegal_instr_o = 1'b1;
+                end
+                else begin
+                    exc_illegal_instr_o = 1'b0;
+                end
+            end
+            OP_LOAD: begin
+                if(funct3 == 3'b011 || funct3 == 3'b110 || funct3 == 3'b111) begin
+                    exc_illegal_instr_o = 1'b1;
+                end
+                else begin
+                    exc_illegal_instr_o = 1'b0;
+                end
+            end
+            OP_STORE: begin
+                if(funct3 == 3'b000 || funct3 == 3'b001 || funct3 == 3'b010) begin
+                    exc_illegal_instr_o = 1'b0;
+                end
+                else begin
+                    exc_illegal_instr_o = 1'b1;
+                end
+            end
+            OP_LUI: begin
+                exc_illegal_instr_o = 1'b0;
+            end
+            OP_JAL: begin
+                exc_illegal_instr_o = 1'b0;
+            end
+            OP_JALR: begin
+                if(funct3 == 3'b000) begin
+                    exc_illegal_instr_o = 1'b0;
+                end
+                else begin
+                    exc_illegal_instr_o = 1'b1;
+                end
+            end
+            OP_AUIPC: begin
+                exc_illegal_instr_o = 1'b0;
+            end
+            OP_SYSTEM: begin
+                if(funct3 == 3'b000) begin
+                    if(instr_rdata_i[19:15] == 5'b0 && instr_rdata_i[11:7] == 5'b0) begin
+                        exc_illegal_instr_o = 1'b0;
+                    end
+                    else begin
+                        exc_illegal_instr_o = 1'b1;
+                    end
+                end
+                else if(funct3 == 3'b100) begin
+                    exc_illegal_instr_o = 1'b1;
+                end
+                else begin
+                    if(funct12 == MSTATUS || funct12 == MISA || funct12 == MTVEC || funct12 == MEPC || funct12 == MCAUSE) begin
+                        exc_illegal_instr_o = 1'b0;
+                    end
+                    else begin
+                        exc_illegal_instr_o = 1'b1;
+                    end
+                end
+            end
+            default: begin
+                exc_illegal_instr_o = 1'b1;
+            end
+        endcase
+    end
+
+endmodule
+
+module datapath (
+    input logic         clk_i,
+    input logic         rst_ni,
+    input logic         fetch_en_i,
+    input logic [31:0]  boot_addr_i,
+    
+    input logic         c_auipc_i,
+    input logic         c_lui_i,
+    input logic         c_branch_i,
+    input logic         c_jal_i,
+    input logic         c_jalr_i,
+    input logic         c_load_i,
+    input logic         c_store_i,
+    input logic         c_regwrite_i,
+    input logic         c_alusrc_i,
+    input logic [4:0]   c_alucont_i,
+    
+    input logic [1:0]   c_csr_op_i,
+    input logic         c_csr_imm_i,
+    input logic         c_readcsr_i,
+    input logic         c_writecsr_i,
+    input logic         c_regwrite_by_csr_i,
+    
+    input logic         c_ecall_i,
+    input logic         c_wfi_i,
+    input logic         c_mret_i,
+    
+    output logic        instr_req_o,
+    output logic [31:0] instr_addr_o,
+    input logic [31:0]  instr_rdata_i,
+    input logic         instr_rvalid_i,
+    input logic         instr_gnt_i,
+    
+    output logic        data_req_o,
+    output logic [31:0] data_addr_o,
+    output logic [31:0] data_wdata_o,
+    output logic [3:0]  data_be_o,
+    output logic        data_we_o,
+    input logic         data_gnt_i,
+    input logic         data_rvalid_i,
+    input logic [31:0]  data_rdata_i,
+    
+    output logic        stall_o,
+    output logic        save_instr_o,
+    output logic        stall_done_o,
+    output logic        flush_o,
+    
+    input logic         irq_i,
+    input logic [4:0]   irq_id_i,
+    output logic        irq_ack_o,
+    output logic [4:0]  irq_id_o,
+    output logic        irq_taken_o,
+    
+    input logic         exc_illegal_instr_i,
+    
+    output logic        clk_en_o,
+    output logic        sleep_o,
+    output logic        sleep_done_o
+);
+
+    
+    logic [4:0]         rs1;
+    logic [4:0]         rs2;
+    logic [4:0]         rd;
+    logic [2:0]         funct3;
+    logic [31:0]        rs1_rdata;
+    logic [31:0]        rs2_rdata;
+    logic [31:0]        rd_data;
+    
+    logic [11:0]        csr_address;
+    logic [31:0]        csr_wdata, csr_rdata;
+    logic [31:0]        mtvec, mepc;
+    logic               irq_enable;
+    logic [5:0]         mcause;
+    
+    logic               c_regwrite;
+    
+    logic [31:0]        imm_jal;
+    logic [31:0]        imm_b;
+    logic [31:0]        imm_i;
+    logic [31:0]        imm_s;
+    logic [31:0]        imm_u;
+    logic [31:0]        imm_csr;
+    
+    logic [31:0]        branch_dest;
+    logic [31:0]        jump_dest;
+    logic               branch_taken;
+    
+    logic [31:0]        alusrc1;
+    logic [31:0]        alusrc2;
+    logic [31:0]        aluout;
+    logic               Nflag;
+    logic               Zflag;
+    logic               Cflag;
+    logic               Vflag;
+    
+    //instruction
+    logic [31:0]        pc_next, pc_IF, pc_ID;
+    enum logic [2:0] {RESET, BOOT, WAIT_GNT, RUN, STALLED, IRQ_TAKEN, IRQ_DONE, SLEEP}       pc_stat_n, pc_stat_c;
+    logic [31:0]        pc_exc;
+    
+    //data
+    enum logic [1:0] {IDLE, WAIT_DATA_GNT, WAIT_DATA_RVALID}           data_stat_n, data_stat_c;
+    
+    logic [3:0]         data_be;
+    logic [1:0]         data_byte_offset;
+    logic [31:0]        data_rdata_se;
+    logic [31:0]        data_wdata_aligned;
+    logic [31:0]        data_rdata_valid;
+    
+    //controls
+    logic   stall_waiting_data, stall_waiting_instr;
+    
+    //irq
+    logic   irq_taken;
+    logic   irq_done;
+    
+    logic       exc_misaligned_instr;
+    logic       exc_taken;
+    logic [4:0] exc_id;
+    
+    logic [31:0] exc_pc;
+    
+
+    assign rs1  = instr_rdata_i[19:15];
+    assign rs2  = instr_rdata_i[24:20];
+    assign rd   = instr_rdata_i[11:7];
+    assign funct3   = instr_rdata_i[14:12];
+    
+    assign imm_jal  = {{11{instr_rdata_i[31]}}, instr_rdata_i[31], instr_rdata_i[19:12], instr_rdata_i[20], instr_rdata_i[30:21], 1'b0};
+    assign imm_b    = {{19{instr_rdata_i[31]}}, instr_rdata_i[31], instr_rdata_i[7], instr_rdata_i[30:25], instr_rdata_i[11:8], 1'b0};
+    assign imm_i    = {{20{instr_rdata_i[31]}}, instr_rdata_i[31:20]};
+    assign imm_s    = {{20{instr_rdata_i[31]}}, instr_rdata_i[31:25], instr_rdata_i[11:7]};
+    assign imm_u    = {instr_rdata_i[31:12], 12'b0};
+ 
+    assign branch_dest  = pc_ID + imm_b;
+    assign jump_dest    = pc_ID + imm_jal;
+    assign pc_exc       = (irq_taken == 1'b1) ? {mtvec[31:8], 1'b0, irq_id_i, 2'b00} : (exc_taken == 1'b1) ? {mtvec[31:8], 8'b0} : '0;
+    
+    assign csr_address  = instr_rdata_i[31:20];
+    assign imm_csr      = {27'b0, instr_rdata_i[19:15]};
+    
+    //byte enable logic
+    assign data_byte_offset     = aluout[1:0];      //mem address
+    
+    always_comb
+    begin
+        case(funct3[1:0])
+            2'b00: begin    //byte
+                case(data_byte_offset)
+                    2'b00:      data_be = 4'b0001;
+                    2'b01:      data_be = 4'b0010;
+                    2'b10:      data_be = 4'b0100;
+                    2'b11:      data_be = 4'b1000;
+                endcase
+            end
+            2'b01: begin    //half-word
+                case(data_byte_offset)
+                    2'b00:      data_be = 4'b0011;
+                    2'b10:      data_be = 4'b1100;
+                    default:    data_be = 4'b0000;
+                endcase
+            end
+            2'b10: begin    //word
+                        data_be = 4'b1111;
+            end
+            default:    data_be = 4'b0000;
+        endcase
+    end
+    
+    //data alignment logic
+    always_comb
+    begin
+        case(funct3[1:0])
+            2'b00: begin
+                case(data_byte_offset)
+                    2'b00: data_wdata_aligned   = {24'b0, rs2_rdata[7:0]};
+                    2'b01: data_wdata_aligned   = {16'b0, rs2_rdata[7:0], 8'b0};
+                    2'b10: data_wdata_aligned   = {8'b0, rs2_rdata[7:0], 16'b0};
+                    2'B11: data_wdata_aligned   = {rs2_rdata[7:0], 24'b0};
+                endcase
+            end
+            2'b01: begin
+                case(data_byte_offset)
+                    2'b00: data_wdata_aligned   = {16'b0, rs2_rdata[15:0]};
+                    2'b10: data_wdata_aligned   = {rs2_rdata[15:0], 16'b0};
+                endcase
+            end
+            2'b10: begin
+                data_wdata_aligned      = rs2_rdata;
+            end
+            default: begin
+                data_wdata_aligned      = '0;
+            end
+        endcase
+    end
+    
+    //data sign-extension
+    assign data_rdata_valid = data_rvalid_i ? data_rdata_i : '0;
+    
+    always_comb
+    begin
+        case(funct3)
+            3'b000: begin   //signed byte
+                case(data_byte_offset)
+                    2'b00:      data_rdata_se   = {{24{data_rdata_valid[7]}}, data_rdata_valid[7:0]};
+                    2'b01:      data_rdata_se   = {{24{data_rdata_valid[15]}}, data_rdata_valid[15:8]};
+                    2'b10:      data_rdata_se   = {{24{data_rdata_valid[23]}}, data_rdata_valid[23:16]};
+                    2'b11:      data_rdata_se   = {{24{data_rdata_valid[31]}}, data_rdata_valid[31:24]};
+                endcase
+            end
+            3'b100: begin   //unsigned byte
+                case(data_byte_offset)
+                    2'b00:      data_rdata_se   = {24'b0, data_rdata_valid[7:0]};
+                    2'b01:      data_rdata_se   = {24'b0, data_rdata_valid[15:8]};
+                    2'b10:      data_rdata_se   = {24'b0, data_rdata_valid[23:16]};
+                    2'b11:      data_rdata_se   = {24'b0, data_rdata_valid[31:24]};
+                endcase
+            end
+            3'b001: begin   //signed half-word
+                case(data_byte_offset)
+                    2'b00:      data_rdata_se   = {{24{data_rdata_valid[15]}}, data_rdata_valid[15:0]};
+                    2'b10:      data_rdata_se   = {{24{data_rdata_valid[31]}}, data_rdata_valid[31:16]};
+                    default:    data_rdata_se   = {{24{data_rdata_valid[15]}}, data_rdata_valid[15:0]};
+                endcase
+            end
+            3'b101: begin   //unsigned half-word
+                case(data_byte_offset)
+                    2'b00:      data_rdata_se   = {24'b0, data_rdata_valid[15:0]};
+                    2'b10:      data_rdata_se   = {24'b0, data_rdata_valid[31:16]};
+                    default:    data_rdata_se   = {24'b0, data_rdata_valid[15:0]};
+                endcase
+            end
+            3'b010:         data_rdata_se   = data_rdata_valid;     //word
+            default:        data_rdata_se   = data_rdata_valid;
+        endcase
+    end
+    
+    //start instruction logic
+    always_ff @(posedge clk_i or negedge rst_ni)
+    begin
+        if(~rst_ni)     pc_stat_c   <= RESET;
+        else            pc_stat_c   <= pc_stat_n;
+    end
+    
+    always_ff @(posedge clk_i or negedge rst_ni)
+    begin
+        if(~rst_ni)         pc_IF   <= '0;
+        else if(~stall_o && ~sleep_o)   pc_IF   <= pc_next;
+    end
+    
+    always_ff @(posedge clk_i or negedge rst_ni)
+    begin
+        if(~rst_ni)                     pc_ID   <= '0;
+        else if(~stall_o && ~flush_o && ~sleep_o)   pc_ID   <= pc_IF;
+    end
+    
+    always_comb
+    begin
+        unique case(pc_stat_c)
+            RESET: begin
+                if(fetch_en_i) begin
+                    pc_stat_n   = BOOT;
+                end
+                else begin
+                    pc_stat_n   = RESET;
+                end
+            end
+            BOOT: begin
+                if(instr_gnt_i) begin
+                    pc_stat_n   = RUN;
+                end
+                else begin
+                    pc_stat_n   = BOOT;
+                end
+            end
+            WAIT_GNT: begin
+                if(irq_taken) begin
+                    pc_stat_n   = IRQ_TAKEN;
+                end
+                else if(instr_gnt_i) begin
+                    pc_stat_n   = RUN;
+                end
+                else begin
+                    pc_stat_n   = WAIT_GNT;
+                end
+            end
+            RUN: begin
+                if(irq_taken || exc_taken) begin
+                    pc_stat_n   = IRQ_TAKEN;
+                end
+                else if(c_mret_i) begin
+                    pc_stat_n   = IRQ_DONE;
+                end
+                else if(c_wfi_i) begin
+                    pc_stat_n   = SLEEP;
+                end
+                else if(stall_o) begin
+                    pc_stat_n   = STALLED;
+                end
+                else begin
+                    if(instr_gnt_i) begin
+                        pc_stat_n   = RUN;
+                    end
+                    else begin
+                        pc_stat_n   = WAIT_GNT;
+                    end
+                end
+            end
+            STALLED: begin
+                if(irq_taken) begin
+                    pc_stat_n       = IRQ_TAKEN;
+                end
+                else if(~stall_o) begin
+                    if(instr_gnt_i) begin
+                        pc_stat_n   = RUN;
+                    end
+                    else begin
+                        pc_stat_n   = WAIT_GNT;
+                    end
+                end
+                else begin
+                    pc_stat_n       = STALLED;
+                end
+            end
+            IRQ_TAKEN: begin
+                if(instr_gnt_i) begin
+                    pc_stat_n       = RUN;
+                end
+                else begin
+                    pc_stat_n       = IRQ_TAKEN;
+                end
+            end
+            IRQ_DONE: begin
+                if(instr_gnt_i) begin
+                    pc_stat_n       = RUN;
+                end
+                else begin
+                    pc_stat_n       = IRQ_DONE;
+                end
+            end
+            SLEEP: begin
+                if(irq_taken) begin
+                    pc_stat_n   = IRQ_TAKEN;
+                end
+                else if(irq_i) begin
+                    pc_stat_n   = RUN;
+                end
+                else begin
+                    pc_stat_n   = SLEEP;
+                end
+            end
+            default: begin
+                pc_stat_n   = pc_stat_c;
+            end
+        endcase
+    end
+    
+    always_comb
+    begin
+        unique case(pc_stat_c)
+            RESET: begin
+                pc_next     = '0;
+                instr_req_o = 1'b0;
+            end
+            BOOT: begin
+                pc_next     = boot_addr_i;
+                instr_req_o = 1'b1;
+            end
+            WAIT_GNT: begin
+                if(irq_taken)  pc_next = pc_exc; 
+                else           pc_next = pc_IF;
+                
+                instr_req_o = 1'b1;
+            end
+            RUN: begin
+                if(irq_taken || exc_taken)  pc_next = pc_exc; 
+                else if(branch_taken)   pc_next = branch_dest;
+                else if(c_jal_i)        pc_next = jump_dest;
+                else if(c_jalr_i)       pc_next = aluout;
+                else if(c_mret_i)       pc_next = mepc;
+                else                    pc_next = pc_IF + 4;
+                
+                instr_req_o = 1'b1;
+            end
+            STALLED: begin
+                if(irq_taken)    pc_next = pc_exc; 
+                else            pc_next = pc_IF + 4;
+                
+                instr_req_o = 1'b1;
+            end
+            IRQ_TAKEN: begin
+                pc_next     = pc_IF + 4;
+                instr_req_o = 1'b1;
+            end
+            IRQ_DONE: begin
+                pc_next     = pc_IF + 4;
+                instr_req_o = 1'b1;
+            end
+            SLEEP: begin
+                if(irq_taken) begin
+                    pc_next = pc_exc;
+                    instr_req_o = 1'b1;
+                end
+                else if(irq_i) begin
+                    pc_next = pc_IF + 4;
+                    instr_req_o = 1'b1;
+                end
+                else begin
+                    pc_next = pc_IF;
+                    instr_req_o = 1'b0;
+                end
+            end
+            default: begin
+                pc_next     = pc_IF;
+                instr_req_o = 1'b0;
+            end
+        endcase
+    end
+    
+    assign instr_addr_o = pc_next;    
+    //end instruction logic
+    
+    //start data logic
+    always_ff @(posedge clk_i or negedge rst_ni)
+    begin
+        if(~rst_ni)     data_stat_c <= IDLE;
+        else            data_stat_c <= data_stat_n;
+    end
+    
+    always_comb
+    begin
+        unique case(data_stat_c)
+            IDLE: begin
+                if(c_store_i) begin
+                    if(data_gnt_i) begin
+                        data_stat_n = IDLE;
+                    end
+                    else begin 
+                        data_stat_n = WAIT_DATA_GNT;
+                    end
+                end 
+                else if(c_load_i) begin
+                    if(data_gnt_i) begin
+                        data_stat_n = WAIT_DATA_RVALID;
+                    end
+                    else begin
+                        data_stat_n = WAIT_DATA_GNT;
+                    end
+                end
+                else begin
+                    data_stat_n     = IDLE;
+                end
+            end
+            WAIT_DATA_GNT: begin
+                if(irq_taken) begin
+                    data_stat_n     = IDLE;
+                end
+                else if(data_gnt_i) begin
+                    if(c_store_i) begin
+                        data_stat_n = IDLE;
+                    end
+                    else begin
+                        data_stat_n = WAIT_DATA_RVALID;
+                    end
+                end
+                else begin
+                    data_stat_n     = WAIT_DATA_GNT;
+                end
+            end
+            WAIT_DATA_RVALID: begin
+                if(irq_taken) begin
+                    data_stat_n     = IDLE;
+                end
+                else if(data_rvalid_i) begin
+                    data_stat_n     = IDLE;
+                end
+                else begin
+                    data_stat_n     = WAIT_DATA_RVALID;
+                end
+            end
+            default: begin
+                data_stat_n =   data_stat_c;
+            end
+        endcase
+    end
+    
+    always_comb
+    begin
+        unique case(data_stat_c)
+            IDLE: begin
+                if(c_store_i) begin
+                    data_req_o      = 1'b1;
+                    data_addr_o     = aluout;
+                    data_wdata_o    = data_wdata_aligned;
+                    data_be_o       = data_be;
+                    data_we_o       = 1'b1;
+                end
+                else if(c_load_i) begin
+                    data_req_o      = 1'b1;
+                    data_addr_o     = aluout;
+                    data_wdata_o    = '0;
+                    data_be_o       = data_be;
+                    data_we_o       = 1'b0;
+                end
+                else begin
+                    data_req_o      = 1'b0;
+                    data_addr_o     = '0;
+                    data_wdata_o    = '0;
+                    data_be_o       = '0;
+                    data_we_o       = 1'b0;                
+                end
+            end
+            WAIT_DATA_GNT: begin
+                if(c_store_i) begin
+                    data_req_o      = 1'b1;
+                    data_addr_o     = aluout;
+                    data_wdata_o    = data_wdata_aligned;
+                    data_be_o       = data_be;
+                    data_we_o       = 1'b1;
+                end
+                else begin
+                    data_req_o      = 1'b1;
+                    data_addr_o     = aluout;
+                    data_wdata_o    = '0;
+                    data_be_o       = data_be;
+                    data_we_o       = 1'b0;
+                end
+            end
+            WAIT_DATA_RVALID: begin
+                data_req_o      = 1'b0;
+                data_addr_o     = aluout;
+                data_wdata_o    = '0;
+                data_be_o       = data_be;
+                data_we_o       = 1'b0;
+            end
+            default: begin
+                data_req_o      = 1'b0;
+                data_addr_o     = '0;
+                data_wdata_o    = '0;
+                data_be_o       = '0;
+                data_we_o       = 1'b0;
+            end
+        endcase
+    end
+    //end data logic
+    
+    //irq logic
+    assign irq_taken    = (irq_i & irq_enable);
+    assign irq_taken_o  = irq_taken;
+    
+    always_comb
+    begin
+        if(pc_stat_c == IRQ_TAKEN) begin
+            irq_ack_o   = 1'b1;
+            irq_id_o    = irq_id_i;
+        end
+        else begin
+            irq_ack_o   = 1'b0;
+            irq_id_o    = '0;
+        end
+    end
+    
+    assign irq_done     = (pc_stat_c == IRQ_DONE) ? 1'b1 : 1'b0;
+    
+    assign exc_misaligned_instr = (c_jal_i && jump_dest[1:0] != 2'b00) || (c_jalr_i && aluout[1:0] != 2'b00) || (branch_taken && branch_dest[1:0] != 2'b00) || (c_mret_i && mepc[1:0] != 2'b00) || (irq_taken && pc_exc[1:0] != 2'b00);
+    assign exc_taken   = (pc_stat_c == RUN) && (exc_misaligned_instr || exc_illegal_instr_i || c_ecall_i);
+//    assign exc_taken    = 1'b0;
+        
+    always_comb
+    begin
+        if(exc_illegal_instr_i) begin
+            exc_id  = EXC_ILLEGAL_INSTR;
+        end
+        else if(exc_misaligned_instr) begin
+            exc_id  = EXC_MISALIGNED_INSTR;
+        end
+        else if(c_ecall_i) begin
+            exc_id  = EXC_ECALL_FROM_M;
+        end
+        else begin
+            exc_id  = '0;
+        end
+    end
+    //end irq logic
+    
+    //control signals
+    assign save_instr_o     = (pc_stat_c == RUN && pc_stat_n == STALLED) || (pc_stat_c == RUN && pc_stat_n == SLEEP);
+    assign stall_done_o     = (pc_stat_c == STALLED && pc_stat_n == RUN);
+    
+    assign flush_o      = (c_jal_i | c_jalr_i | branch_taken | irq_taken | c_mret_i | exc_taken);
+    
+    assign stall_waiting_data   = (data_stat_n == WAIT_DATA_GNT || data_stat_n == WAIT_DATA_RVALID) ? 1'b1 : 1'b0;
+    assign stall_waiting_instr  = (pc_stat_c == WAIT_GNT) ?  1'b1 : 1'b0;
+    assign stall_o  = (stall_waiting_data | stall_waiting_instr) & ~irq_taken & ~exc_taken;
+    
+    assign clk_en_o = (pc_stat_n == SLEEP && pc_stat_c == SLEEP) ? 1'b0 : 1'b1;
+    assign sleep_o  = (pc_stat_n == SLEEP) ? 1'b1 : 1'b0;
+    assign sleep_done_o = (pc_stat_c == SLEEP && pc_stat_n != SLEEP) ? 1'b1 : 1'b0;
+    //end control signals
+    
+    //csr regs  
+    assign csr_wdata    = (c_csr_imm_i) ? imm_csr : rs1_rdata;
+    assign exc_pc       = (pc_stat_c == SLEEP) ? pc_IF : pc_ID;
+    
+    my_priv_module i_priv_module
+    (
+        .clk_i      (clk_i),
+        .rst_ni     (rst_ni),
+        
+        .csr_addr_i     (csr_address),
+        .c_csr_op_i     (c_csr_op_i),         
+        .c_csr_imm_i    (c_csr_imm_i),        
+        .c_readcsr_i    (c_readcsr_i),
+        .c_writecsr_i   (c_writecsr_i),
+        
+        .c_mret_i       (c_mret_i),
+        
+        .csr_wdata_i    (csr_wdata),
+        .csr_rdata_o    (csr_rdata),
+        
+        .mstatus_mie_o  (irq_enable),
+        .mtvec_o        (mtvec),
+        .mepc_o         (mepc),
+        .mcause_o       (mcause),
+        
+        .irq_taken_i    (irq_taken),
+        .irq_i          (irq_i),
+        .irq_id_i       (irq_id_i),
+        .exc_taken_i    (exc_taken),
+        .exc_id_i       (exc_id),
+        .exc_pc_i       (exc_pc),
+        
+        .irq_done_i     (irq_done)
+    );
+    
+    always_comb
+    begin
+        if(c_branch_i) begin
+            case(funct3)
+                3'b000: branch_taken = Zflag;               //beq
+                3'b001: branch_taken = !Zflag;              //bne
+                3'b100: branch_taken = (Nflag != Vflag);    //blt
+                3'b101: branch_taken = (Nflag == Vflag);    //bge
+                3'b110: branch_taken = !Cflag;              //bltu
+                3'b111: branch_taken = Cflag;               //bgeu
+                default: branch_taken = 1'b0;
+            endcase
+        end
+        else branch_taken = 1'b0;
+    end
+        
+    assign c_regwrite   = (c_regwrite_i | c_regwrite_by_csr_i);
+    regfile i_regfile (
+        .clk            (clk_i),
+        .rst_n          (rst_ni),
+        .stall_i        (stall_o),
+        .sleep_i        (sleep_o),
+        .rs1_i          (rs1),
+        .rs2_i          (rs2),
+        .rd_i           (rd),
+        .we_i           (c_regwrite),
+        .wdata_i        (rd_data),
+        .rs1_rdata_o    (rs1_rdata),
+        .rs2_rdata_o    (rs2_rdata)
+    );
+    
+    always_comb
+    begin
+        if(c_auipc_i)       alusrc1 = pc_ID;
+        else if(c_lui_i)    alusrc1 = 32'b0;
+        else                alusrc1 = rs1_rdata;
+    end
+    
+    always_comb
+    begin
+        if(c_auipc_i | c_lui_i)             alusrc2 = imm_u;
+        else if(c_alusrc_i & c_store_i)     alusrc2 = imm_s;
+        else if(c_alusrc_i)                 alusrc2 = imm_i;
+        else                                alusrc2 = rs2_rdata;
+    end
+    
+    alu i_alu(
+        .a			(alusrc1),
+        .b			(alusrc2),
+        .alucont	(c_alucont_i),
+        .result	    (aluout),
+        .N			(Nflag),
+        .Z			(Zflag),
+        .C			(Cflag),
+        .V			(Vflag)
+    );
+    
+    always_comb
+    begin
+        if(c_jal_i | c_jalr_i)          rd_data = pc_ID + 4;
+        else if(c_load_i)               rd_data = data_rdata_se;
+        else if(c_regwrite_by_csr_i)    rd_data = csr_rdata;
+        else                            rd_data = aluout;
+    end
+    
+
+`ifndef VERILATOR
+`ifdef TRACE_EXECUTION
+
+  logic tracer_clk;
+  logic is_running;
+  
+    assign tracer_clk = clk_i;
+    assign is_running = (pc_stat_c == RUN);
+
+  my_core_trace my_core_trace_i
+  (
+    .clk            (tracer_clk), // always-running clock for tracing
+    .rst_n          (rst_ni),
+
+    .fetch_enable   (fetch_en_i),
+
+    .pc             (pc_ID),
+    .instr          (instr_rdata_i),
+
+    .is_running     (is_running),
+
+    .rs1_value      (rs1_rdata),
+    .rs2_value      (rs2_rdata),
+    .rd_value       (rd_data),
+    
+    .mem_addr       (data_addr_o),
+    .mem_wdata      (data_wdata_o),
+
+    .imm_u_type     (imm_u),
+    .imm_j_type     (imm_jal),
+    .imm_i_type     (imm_i),
+    .imm_csr_type   (imm_csr),
+    .imm_s_type     (imm_s),
+    .imm_b_type     (imm_b)
+  );
+`endif
+`endif
+    
+endmodule
